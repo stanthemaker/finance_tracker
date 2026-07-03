@@ -7,7 +7,6 @@ const fmt = (n) =>
 const typeColor = (t) => {
   if (t === "income")  return "text-green-600";
   if (t === "expense") return "text-red-600";
-  if (t === "payment") return "text-blue-600";
   return "text-gray-500";
 };
 

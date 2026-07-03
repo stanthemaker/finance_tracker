@@ -65,12 +65,19 @@ export default function Statements({ onScanSuccess }) {
           {scanResult.skipped.length > 0 && (
             <p className="text-gray-500">⏭ Skipped (already imported): {scanResult.skipped.join(", ")}</p>
           )}
+          {scanResult.duplicates?.length > 0 && (
+            <p className="text-amber-600">
+              🚫 Duplicates ignored (same content already imported):{" "}
+              {scanResult.duplicates.map((d) => d.file).join(", ")}
+            </p>
+          )}
           {scanResult.errors.length > 0 && (
             <p className="text-red-600">
               ❌ Errors: {scanResult.errors.map((e) => `${e.file}: ${e.error}`).join("; ")}
             </p>
           )}
-          {scanResult.imported.length === 0 && scanResult.errors.length === 0 && (
+          {scanResult.imported.length === 0 && scanResult.errors.length === 0 &&
+           !scanResult.duplicates?.length && (
             <p className="text-gray-500">No new statements found.</p>
           )}
         </div>

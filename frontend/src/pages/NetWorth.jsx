@@ -84,7 +84,7 @@ export default function NetWorth() {
       <div className="text-center py-20 text-gray-400">
         <p className="text-5xl mb-4">📈</p>
         <p className="text-lg">
-          Drop J.P. Morgan investment PDFs and Capital One savings PDFs into{" "}
+          Drop J.P. Morgan or Fidelity investment PDFs and Capital One savings PDFs into{" "}
           <code className="bg-gray-100 px-1 rounded">data/statements/</code> to populate.
         </p>
       </div>

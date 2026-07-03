@@ -483,6 +483,7 @@ RULES: list[tuple[str, list[str]]] = [
 ]
 
 CATEGORY_COLORS = {
+    # ── expense ──
     "Groceries": "#4CAF50",
     "Dining": "#FF5722",
     "Travel": "#2196F3",
@@ -494,19 +495,85 @@ CATEGORY_COLORS = {
     "Education": "#3F51B5",
     "Insurance": "#E91E63",
     "Investment": "#009688",
+    # ── income ──
+    "PhD Salary": "#43A047",
+    "Tax Refund": "#66BB6A",
+    "Reimbursement": "#26A69A",
+    "Interest": "#9CCC65",
+    # ── transfer ──
+    "Tax": "#EF6C00",
+    "Brokerage": "#5C6BC0",
+    "Reallocation": "#78909C",
+    # ── shared fallback ──
     "Other": "#757575",
 }
 
-ALL_CATEGORIES = list(CATEGORY_COLORS.keys())
+# Categories available for each transaction type. The category dropdown in the UI
+# is scoped to the row's tx_type using this map.
+CATEGORIES_BY_TYPE: dict[str, list[str]] = {
+    "expense": [
+        "Groceries", "Dining", "Travel", "Shopping", "Entertainment", "Health",
+        "Utilities", "Housing", "Education", "Insurance", "Investment", "Other",
+    ],
+    "income": ["PhD Salary", "Tax Refund", "Reimbursement", "Interest", "Other"],
+    "transfer": ["Tax", "Brokerage", "Reallocation", "Other"],
+}
+
+# Category a transaction falls back to when its type changes (auto-reset).
+DEFAULT_CATEGORY: dict[str, str] = {
+    "expense": "Other",
+    "income": "Other",
+    "transfer": "Reallocation",
+}
+
+# Flat, de-duplicated list of every category across all types (used for the
+# top-of-page filter dropdown and PATCH validation).
+ALL_CATEGORIES = list(dict.fromkeys(
+    c for cats in CATEGORIES_BY_TYPE.values() for c in cats
+))
 
 
-def categorize(description: str) -> str:
-    desc = description.lower()
+def _categorize_expense(desc: str) -> str:
     for category, keywords in RULES:
         for kw in keywords:
             if kw in desc:
                 return category
     return "Other"
+
+
+def _categorize_income(desc: str) -> str:
+    if any(k in desc for k in ["tax refund", "tax ref", "irs treas", "franchise tax bd"]):
+        return "Tax Refund"
+    if any(k in desc for k in ["interest paid", "interest earned", "interest payment"]):
+        return "Interest"
+    if any(k in desc for k in [
+        "payroll", "direct dep", "direct deposit", "direct pay",
+        "uc berkeley", "berkeley", "gusto", "adp ", "paychex",
+    ]):
+        return "PhD Salary"
+    if any(k in desc for k in ["zelle payment from", "venmo from", "cashapp from", "reimburse"]):
+        return "Reimbursement"
+    return "Other"
+
+
+def _categorize_transfer(desc: str) -> str:
+    if any(k in desc for k in [
+        "brokerage", "bkrg", "fid bkg", "fidelity", "schwab", "vanguard", "moneyline",
+    ]):
+        return "Brokerage"
+    if any(k in desc for k in ["tax", "irs", "estimated tax", "treas"]):
+        return "Tax"
+    return "Reallocation"
+
+
+def categorize(description: str, tx_type: str = "expense") -> str:
+    """Assign a category, scoped to the transaction's type."""
+    desc = description.lower()
+    if tx_type == "income":
+        return _categorize_income(desc)
+    if tx_type == "transfer":
+        return _categorize_transfer(desc)
+    return _categorize_expense(desc)
 
 
 def infer_tx_type(description: str, amount: float, account_type: str) -> str:
@@ -528,6 +595,9 @@ def infer_tx_type(description: str, amount: float, account_type: str) -> str:
                     "mobile payment",
                 ]
             ):
+                # "payment" is an internal skip-sentinel only: the import loop
+                # drops these rows (credit-card bill payments) so they are never
+                # stored or shown as a user-facing type. See main.py _scan_statements.
                 return "payment"
             return "income"  # merchant refund / statement credit
         else:
@@ -546,6 +616,7 @@ def infer_tx_type(description: str, amount: float, account_type: str) -> str:
             "ach debit",
             "capital one",  # transfers to Capital One savings / investments
             "manual db-bkrg",  # manual debit to brokerage (investment contribution)
+            "fid bkg svc llc moneyline",
         ]
         # ── checking inflows (amount > 0) ─────────────────────────────────
         _INCOME_IN = [

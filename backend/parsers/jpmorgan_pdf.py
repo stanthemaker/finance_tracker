@@ -83,12 +83,38 @@ def _extract_asset_allocation(text: str) -> dict:
     return result
 
 
+# Page 5 "Summary of Accounts" total row, 6 money columns (any may be a
+# parenthesised negative, e.g. a full ACAT transfer-out):
+#   "TOTAL PORTFOLIO VALUE $15,413.20 ($15,392.45) $0.04 $0.00 ($20.79) $0.00"
+#    last month | net deposits & withdrawals | income | fees | Δ investment value | this month
+# [ \t]+ (not \s+) keeps the match on one physical line so the 2-column page-3
+# row ("... $15,413.20 $0.00") can't be gathered across a newline.
+_MONEY = r"\(?\$?[\d,]+\.?\d*\)?"
+_SUMMARY_TOTAL = re.compile(
+    r"total portfolio value[ \t]+"
+    + r"[ \t]+".join(f"({_MONEY})" for _ in range(6)),
+    re.IGNORECASE,
+)
+
+
+def _extract_summary_totals(text: str) -> dict:
+    """
+    Return {'net_deposits', 'market_gain'} from the page-5 Summary of Accounts
+    total row when present. 'market_gain' is JPMorgan's own "Change in Investment
+    Value" column, so a transfer between accounts nets out correctly instead of
+    looking like a market loss. Returns {} if the row isn't found.
+    """
+    m = _SUMMARY_TOTAL.search(text)
+    if not m:
+        return {}
+    return {
+        "net_deposits": _amt(m.group(2)) or 0.0,   # net deposits & withdrawals
+        "market_gain":  _amt(m.group(5)),          # change in investment value
+    }
+
+
 def _extract_net_deposits(text: str) -> float:
-    """
-    Page 5 has 6-column format: 'TOTAL PORTFOLIO VALUE $7,693.50 $150.00 $0.02 $0.00 $322.38 $8,165.90'
-    Page 3 has 2-column format: 'TOTAL PORTFOLIO VALUE $7,693.50 $8,165.90'
-    We need page 5's 2nd value ($150.00). Require a 3rd dollar value to avoid matching page 3.
-    """
+    """Fallback net-deposits extraction when the summary total row isn't found."""
     m = re.search(
         r"total portfolio value\s+\$[\d,]+\.?\d*\s+\$?([\d,]+\.?\d*)\s+\$[\d,]",
         text, re.IGNORECASE
@@ -241,10 +267,17 @@ def parse_jpmorgan(filepath: str, filename: str) -> Optional[dict]:
         statement_date = _extract_date(summary_text)
         prev_value, total_value = _extract_portfolio_values(summary_text)
         asset_alloc = _extract_asset_allocation(summary_text)
-        net_deposits = _extract_net_deposits(summary_text)
 
-        market_gain = None
-        if total_value is not None and prev_value is not None:
+        # Prefer the page-5 Summary of Accounts totals: they report net
+        # deposits/withdrawals (incl. transfers) and the true change in
+        # investment value, so an ACAT transfer-out nets to ~$0 gain.
+        totals = _extract_summary_totals(summary_text)
+        net_deposits = totals.get("net_deposits")
+        if net_deposits is None:
+            net_deposits = _extract_net_deposits(summary_text)
+
+        market_gain = totals.get("market_gain")
+        if market_gain is None and total_value is not None and prev_value is not None:
             market_gain = round(total_value - prev_value - (net_deposits or 0), 2)
 
         holdings = _extract_holdings(pdf)

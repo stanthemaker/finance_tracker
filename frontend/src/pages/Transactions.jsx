@@ -7,6 +7,7 @@ const fmt = (n) =>
 export default function Transactions({ month }) {
   const [data, setData]             = useState({ total: 0, items: [] });
   const [categories, setCategories] = useState([]);
+  const [catsByType, setCatsByType] = useState({});
   const [catColors, setCatColors]   = useState({});
   const [filterCat, setFilterCat]   = useState("");
   const [filterType, setFilterType] = useState("");
@@ -29,8 +30,9 @@ export default function Transactions({ month }) {
   useEffect(load, [month, filterCat, filterType]);
 
   useEffect(() => {
-    fetchCategories().then(({ categories, colors }) => {
+    fetchCategories().then(({ categories, by_type, colors }) => {
       setCategories(categories);
+      setCatsByType(by_type || {});
       setCatColors(colors);
     });
   }, []);
@@ -69,7 +71,6 @@ export default function Transactions({ month }) {
   const typeColor = (t) => {
     if (t === "income")  return "text-green-600";
     if (t === "expense") return "text-red-600";
-    if (t === "payment") return "text-blue-600";
     return "text-gray-500";
   };
 
@@ -97,7 +98,6 @@ export default function Transactions({ month }) {
             <option value="expense">Expense</option>
             <option value="income">Income</option>
             <option value="transfer">Transfer</option>
-            <option value="payment">Payment</option>
           </select>
         </div>
       </div>
@@ -143,7 +143,7 @@ export default function Transactions({ month }) {
                         border:     `1px solid ${(catColors[t.category] || "#ccc")}55`,
                       }}
                     >
-                      {categories.map((c) => <option key={c}>{c}</option>)}
+                      {(catsByType[t.tx_type] || categories).map((c) => <option key={c}>{c}</option>)}
                     </select>
                   </td>
                   <td className="px-4 py-2">
@@ -156,7 +156,6 @@ export default function Transactions({ month }) {
                       <option value="income">income</option>
                       <option value="expense">expense</option>
                       <option value="transfer">transfer</option>
-                      <option value="payment">payment</option>
                     </select>
                   </td>
                   <td className={`px-4 py-2 text-right font-medium ${typeColor(t.tx_type)}`}>

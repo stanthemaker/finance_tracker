@@ -15,8 +15,12 @@ with get_conn() as conn:
     type_changes = {}
 
     for row in rows:
-        new_cat  = categorize(row["description"])
         new_type = infer_tx_type(row["description"], row["amount"], row["account_type"])
+        # "payment" is an import-only skip sentinel and never a stored type;
+        # keep the existing type if it ever surfaces here.
+        if new_type == "payment":
+            new_type = row["tx_type"]
+        new_cat  = categorize(row["description"], new_type)
 
         if new_cat != row["category"] or new_type != row["tx_type"]:
             updates.append((new_cat, new_type, row["id"]))

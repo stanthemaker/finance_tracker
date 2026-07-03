@@ -1,5 +1,6 @@
 import os
 import calendar
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -8,9 +9,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from database import get_conn, init_db
-from categorizer import categorize, infer_tx_type, ALL_CATEGORIES, CATEGORY_COLORS
+from categorizer import (
+    categorize, infer_tx_type, ALL_CATEGORIES, CATEGORY_COLORS,
+    CATEGORIES_BY_TYPE, DEFAULT_CATEGORY,
+)
 from parsers.chase_pdf import parse_statement
 from parsers.jpmorgan_pdf import is_jpmorgan, parse_jpmorgan
+from parsers.fidelity_pdf import is_fidelity, parse_fidelity
 from parsers.capitalone_pdf import is_capitalone_savings, parse_capitalone_savings
 from advice import generate_advice
 
@@ -52,10 +57,21 @@ def _friendly_filename(primary_month: str, account_type: str, broker: str = "Cha
     mon_abbr = calendar.month_abbr[int(mon)]
     if broker == "JPMorgan":
         return f"{year}-{mon_abbr}-Brokerage-JPMorgan.pdf"
+    if broker == "Fidelity":
+        return f"{year}-{mon_abbr}-Brokerage-Fidelity.pdf"
     if broker == "CapitalOne":
         return f"{year}-{mon_abbr}-Savings-CapitalOne.pdf"
     kind = "Credit" if account_type == "credit" else "Checking"
     return f"{year}-{mon_abbr}-{kind}-Chase.pdf"
+
+
+def _file_hash(pdf_path) -> str:
+    """SHA-256 of the file's bytes — a content fingerprint independent of filename."""
+    h = hashlib.sha256()
+    with open(pdf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _rename_pdf(pdf_path, new_name: str):
@@ -75,12 +91,17 @@ def _rename_pdf(pdf_path, new_name: str):
 
 def _scan_statements() -> dict:
     pdfs = sorted(STATEMENTS_DIR.glob("*.pdf"))
-    imported, skipped, errors = [], [], []
+    imported, skipped, errors, duplicates = [], [], [], []
 
     with get_conn() as conn:
         known_statements = {row["filename"] for row in conn.execute("SELECT filename FROM statements")}
         known_portfolio  = {row["filename"] for row in conn.execute("SELECT filename FROM portfolio_snapshots")}
         known_balances   = {row["filename"] for row in conn.execute("SELECT filename FROM account_balances")}
+        # Content fingerprints of everything already imported (across all tables).
+        known_hashes = set()
+        for tbl in ("statements", "portfolio_snapshots", "account_balances"):
+            for row in conn.execute(f"SELECT content_hash FROM {tbl} WHERE content_hash IS NOT NULL"):
+                known_hashes.add(row["content_hash"])
     known = known_statements | known_portfolio | known_balances
 
     for pdf_path in pdfs:
@@ -89,11 +110,21 @@ def _scan_statements() -> dict:
             skipped.append(filename)
             continue
 
+        # ── Content-based duplicate guard ────────────────────────────────────
+        # Reject a file whose exact bytes were already imported — even under a
+        # different name. This catches accidental re-uploads before any parsing
+        # or renaming happens, so no duplicate transactions are created.
+        file_hash = _file_hash(pdf_path)
+        if file_hash in known_hashes:
+            duplicates.append({"file": filename, "reason": "identical content already imported"})
+            continue
+
         # ── Detect PDF type (open once) ──────────────────────────────────────
         try:
             import pdfplumber
             with pdfplumber.open(str(pdf_path)) as _pdf:
                 _is_jpm = is_jpmorgan(_pdf)
+                _is_fid = is_fidelity(_pdf)
                 _is_c1  = is_capitalone_savings(_pdf)
         except Exception as e:
             errors.append({"file": filename, "error": str(e)})
@@ -115,40 +146,43 @@ def _scan_statements() -> dict:
             with get_conn() as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO account_balances"
-                    "(statement_date,account_type,filename,balance) VALUES (?,?,?,?)",
-                    (primary_month, "savings", filename, c1["balance"]),
+                    "(statement_date,account_type,filename,balance,content_hash) VALUES (?,?,?,?,?)",
+                    (primary_month, "savings", filename, c1["balance"], file_hash),
                 )
+            known_hashes.add(file_hash)
             imported.append({
                 "file": filename, "month": primary_month,
                 "type": "savings", "balance": c1["balance"],
             })
             continue
 
-        if _is_jpm:
+        if _is_jpm or _is_fid:
+            broker = "JPMorgan" if _is_jpm else "Fidelity"
+            parse_fn = parse_jpmorgan if _is_jpm else parse_fidelity
             try:
-                result = parse_jpmorgan(str(pdf_path), filename)
+                result = parse_fn(str(pdf_path), filename)
             except Exception as e:
-                errors.append({"file": filename, "error": f"JPMorgan parse error: {e}"})
+                errors.append({"file": filename, "error": f"{broker} parse error: {e}"})
                 continue
 
             if not result or result.get("total_value") is None:
-                errors.append({"file": filename, "error": "JPMorgan: no portfolio value found"})
+                errors.append({"file": filename, "error": f"{broker}: no portfolio value found"})
                 continue
 
             primary_month = result["statement_date"] or filename[:7]
-            filename = _rename_pdf(pdf_path, _friendly_filename(primary_month, "brokerage", "JPMorgan"))
+            filename = _rename_pdf(pdf_path, _friendly_filename(primary_month, "brokerage", broker))
             result["filename"] = filename
 
             with get_conn() as conn:
                 cur = conn.execute(
                     "INSERT OR REPLACE INTO portfolio_snapshots"
-                    "(statement_date,filename,total_value,prev_value,cash_value,"
-                    "equity_value,net_deposits,market_gain) VALUES (?,?,?,?,?,?,?,?)",
+                    "(statement_date,broker,filename,total_value,prev_value,cash_value,"
+                    "equity_value,net_deposits,market_gain,content_hash) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (
-                        result["statement_date"], filename,
+                        result["statement_date"], broker, filename,
                         result["total_value"], result["prev_value"],
                         result["cash_value"], result["equity_value"],
-                        result["net_deposits"], result["market_gain"],
+                        result["net_deposits"], result["market_gain"], file_hash,
                     ),
                 )
                 snap_id = cur.lastrowid
@@ -167,6 +201,7 @@ def _scan_statements() -> dict:
                         ),
                     )
 
+            known_hashes.add(file_hash)
             imported.append({
                 "file": filename, "month": primary_month,
                 "type": "brokerage", "holdings": len(result.get("holdings", [])),
@@ -195,14 +230,13 @@ def _scan_statements() -> dict:
 
         with get_conn() as conn:
             cur = conn.execute(
-                "INSERT INTO statements(filename, account_type, month) VALUES (?,?,?)",
-                (filename, account_type, primary_month),
+                "INSERT INTO statements(filename, account_type, month, content_hash) VALUES (?,?,?,?)",
+                (filename, account_type, primary_month, file_hash),
             )
             stmt_id = cur.lastrowid
 
             rows = []
             for t in raw_txns:
-                cat = categorize(t["description"])
                 tx_type = infer_tx_type(t["description"], t["amount"], account_type)
                 if tx_type == "payment":
                     continue
@@ -212,6 +246,7 @@ def _scan_statements() -> dict:
                         "chase credit crd", "payment to chase card", "autopay",
                     ]):
                         continue
+                cat = categorize(t["description"], tx_type)
                 rows.append((
                     stmt_id, t["date"], t["description"], t["amount"],
                     cat, 0, tx_type, t["date"][:7], 0, None, 0, None, 0,
@@ -230,16 +265,17 @@ def _scan_statements() -> dict:
             if ending_balance is not None and account_type == "checking":
                 conn.execute(
                     "INSERT OR REPLACE INTO account_balances"
-                    "(statement_date,account_type,filename,balance) VALUES (?,?,?,?)",
-                    (primary_month, "checking", filename, ending_balance),
+                    "(statement_date,account_type,filename,balance,content_hash) VALUES (?,?,?,?,?)",
+                    (primary_month, "checking", filename, ending_balance, file_hash),
                 )
 
+        known_hashes.add(file_hash)
         imported.append({
             "file": filename, "month": primary_month,
             "count": len(raw_txns), "type": account_type,
         })
 
-    return {"imported": imported, "skipped": skipped, "errors": errors}
+    return {"imported": imported, "skipped": skipped, "errors": errors, "duplicates": duplicates}
 
 
 @app.post("/api/scan")
@@ -314,13 +350,18 @@ class TxUpdate(BaseModel):
 def update_transaction(tx_id: int, body: TxUpdate):
     if body.category is not None and body.category not in ALL_CATEGORIES:
         raise HTTPException(400, f"Unknown category: {body.category}")
-    if body.tx_type is not None and body.tx_type not in ("income", "expense", "transfer", "payment"):
+    if body.tx_type is not None and body.tx_type not in ("income", "expense", "transfer"):
         raise HTTPException(400, f"Unknown tx_type: {body.tx_type}")
 
     sets, params = [], []
     if body.tx_type is not None:
         sets.append("tx_type=?")
         params.append(body.tx_type)
+        # When the type changes and no explicit category is given, the old
+        # category may not be valid for the new type — reset it to the default.
+        if body.category is None:
+            sets.append("category=?")
+            params.append(DEFAULT_CATEGORY.get(body.tx_type, "Other"))
     if body.category is not None:
         sets += ["category=?", "is_override=1"]
         params.append(body.category)
@@ -564,7 +605,12 @@ def delete_statement(stmt_id: int):
 
 @app.get("/api/categories")
 def list_categories():
-    return {"categories": ALL_CATEGORIES, "colors": CATEGORY_COLORS}
+    return {
+        "categories": ALL_CATEGORIES,
+        "by_type": CATEGORIES_BY_TYPE,
+        "default_by_type": DEFAULT_CATEGORY,
+        "colors": CATEGORY_COLORS,
+    }
 
 
 # ── net worth ─────────────────────────────────────────────────────────────────
@@ -592,19 +638,28 @@ def get_networth():
         b["statement_date"] for b in balances
     })
 
-    # Current snapshot with asset class breakdown for pie chart
+    # More than one brokerage (e.g. J.P. Morgan + Fidelity) can report in the same
+    # month, so aggregate all snapshots for a given month rather than picking one.
+    def _sum_snaps(snaps: list, key: str):
+        vals = [s[key] for s in snaps if s[key] is not None]
+        return round(sum(vals), 2) if vals else None
+
+    latest_month = max((s["statement_date"] for s in snapshots), default=None)
+    latest_snaps = [s for s in snapshots if s["statement_date"] == latest_month]
+
+    # Current snapshot with asset class breakdown for pie chart (summed across brokers)
     current_assets = None
-    if snapshots:
-        s = snapshots[-1]
+    if latest_snaps:
         current_assets = {
-            "portfolio_equity": s["equity_value"],
-            "portfolio_cash":   s["cash_value"],
-            "snapshot_date":    s["statement_date"],
+            "portfolio_equity": _sum_snaps(latest_snaps, "equity_value"),
+            "portfolio_cash":   _sum_snaps(latest_snaps, "cash_value"),
+            "snapshot_date":    latest_month,
         }
 
     timeline = []
     for month in all_months:
-        portfolio = next((s["total_value"] for s in snapshots if s["statement_date"] == month), None)
+        month_snaps = [s for s in snapshots if s["statement_date"] == month]
+        portfolio = _sum_snaps(month_snaps, "total_value")
         checking  = balance_map.get((month, "checking"))
         savings   = balance_map.get((month, "savings"))
 
@@ -619,16 +674,27 @@ def get_networth():
             "net_worth": net_worth,
         })
 
-    # Current snapshot holdings
+    # Current snapshot: aggregate figures + combined holdings across all brokers
+    # reporting in the latest month.
     current_holdings: list[dict] = []
     current_snapshot: Optional[dict] = None
-    if snapshots:
-        latest = snapshots[-1]
-        current_snapshot = latest
+    if latest_snaps:
+        current_snapshot = {
+            "statement_date": latest_month,
+            "total_value":    _sum_snaps(latest_snaps, "total_value"),
+            "prev_value":     _sum_snaps(latest_snaps, "prev_value"),
+            "cash_value":     _sum_snaps(latest_snaps, "cash_value"),
+            "equity_value":   _sum_snaps(latest_snaps, "equity_value"),
+            "net_deposits":   _sum_snaps(latest_snaps, "net_deposits"),
+            "market_gain":    _sum_snaps(latest_snaps, "market_gain"),
+        }
+        snap_ids = [s["id"] for s in latest_snaps]
+        placeholders = ",".join("?" * len(snap_ids))
         with get_conn() as conn:
             current_holdings = [dict(r) for r in conn.execute(
-                "SELECT * FROM portfolio_holdings WHERE snapshot_id=? ORDER BY market_value DESC",
-                (latest["id"],),
+                f"SELECT * FROM portfolio_holdings WHERE snapshot_id IN ({placeholders}) "
+                "ORDER BY market_value DESC",
+                snap_ids,
             ).fetchall()]
 
     # Latest balance for each account type (for pie chart)

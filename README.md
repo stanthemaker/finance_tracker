@@ -12,6 +12,7 @@ all running on your own machine. No data ever leaves your computer.
   - Chase checking & credit card statements
   - J.P. Morgan brokerage statements (portfolio value + holdings)
   - Capital One savings statements (balance)
+  - Fidelity brokeage statements
 - **Dashboard** — monthly income, expenses, net savings, and spending by category,
   with an "Average (All Months)" view.
 - **Transactions** — review, re-categorize, and flag transactions. Mark one-time
